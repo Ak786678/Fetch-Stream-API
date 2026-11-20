@@ -92,7 +92,14 @@ async function validatePublicUrl(value) {
   const addresses = await dns.lookup(url.hostname, {
     all: true
   });
-
+console.log('PROVIDER DNS CHECK:', {
+  hostname: url.hostname,
+  addresses: addresses.map(address => ({
+    family: address.family,
+    public: isPublicAddress(address.address)
+  }))
+});
+  
   if (
     addresses.length === 0 ||
     addresses.some(address => !isPublicAddress(address.address))
