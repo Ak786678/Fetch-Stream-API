@@ -88,7 +88,14 @@ const searchAnimeSalt = async (query) => {
             }
         });
         return results;
-    } catch { return []; }
+   } catch (error) {
+    console.error('AnimeSalt search failed:', {
+        message: error.message,
+        status: error.response?.status,
+        url: error.config?.url
+    });
+    return [];
+}
 };
 
 const searchToonStream = async (query) => {
@@ -120,7 +127,14 @@ const searchToonStream = async (query) => {
             }
         });
         return results;
-    } catch { return []; }
+    } catch (error) {
+    console.error('ToonStream search failed:', {
+        message: error.message,
+        status: error.response?.status,
+        url: error.config?.url
+    });
+    return [];
+}
 };
 
 // Automatic Resolver for Embed Players
