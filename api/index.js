@@ -1,4 +1,5 @@
-
+const dns = require('node:dns').promises;
+const net = require('node:net');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -32,12 +33,85 @@ const client = axios.create({
   validateStatus: status => status >= 200 && status < 300
 });
 
+function isPublicIPv4(ip) {
+  const parts = ip.split('.').map(Number);
+
+  if (parts.length !== 4 ||
+      parts.some(n => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return false;
+  }
+
+  const [a, b] = parts;
+
+  return !(
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0) ||
+    (a === 192 && b === 0 && parts[2] === 2) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && parts[2] === 100) ||
+    (a === 203 && b === 0 && parts[2] === 113)
+  );
+}
+
+function isPublicAddress(ip) {
+  if (net.isIP(ip) === 4) {
+    return isPublicIPv4(ip);
+  }
+
+  // Conservative IPv6 policy.
+  return false;
+}
+
+async function validatePublicUrl(value) {
+  const url = new URL(value);
+
+  if (
+    url.protocol !== 'https:' ||
+    url.port ||
+    url.username ||
+    url.password ||
+    !url.hostname ||
+    url.hostname === 'localhost' ||
+    url.hostname.endsWith('.localhost') ||
+    url.hostname.endsWith('.local')
+  ) {
+    throw new Error('Unsafe redirect destination');
+  }
+
+  if (net.isIP(url.hostname)) {
+    throw new Error('IP-based redirects are not allowed');
+  }
+
+  const addresses = await dns.lookup(url.hostname, {
+    all: true
+  });
+
+  if (
+    addresses.length === 0 ||
+    addresses.some(address => !isPublicAddress(address.address))
+  ) {
+    throw new Error('Redirect destination is not public');
+  }
+
+  return url.toString();
+}
+
 async function fetchProviderResponse(url, provider) {
   let currentUrl = providerUrl(url, provider);
 
   for (let redirect = 0; redirect <= 5; redirect++) {
+    await validatePublicUrl(currentUrl);
+
     const response = await client.get(currentUrl, {
       headers: getHeaders(provider.base),
+      maxRedirects: 0,
       validateStatus: status =>
         (status >= 200 && status < 300) ||
         [301, 302, 303, 307, 308].includes(status)
@@ -53,22 +127,16 @@ async function fetchProviderResponse(url, provider) {
       throw new Error('Provider redirect has no destination');
     }
 
-    // Validate every redirect before making another request.
-    // This prevents the API from following redirects to
-    // arbitrary external hosts.
-    const redirectUrl = new URL(location, currentUrl);
+    const nextUrl = new URL(location, currentUrl);
 
-console.log('PROVIDER REDIRECT:', {
-  from: new URL(currentUrl).hostname,
-  to: redirectUrl.hostname,
-  path: redirectUrl.pathname,
-  status: response.status
-});
+    console.log('PROVIDER REDIRECT:', {
+      from: new URL(currentUrl).hostname,
+      to: nextUrl.hostname,
+      path: nextUrl.pathname,
+      status: response.status
+    });
 
-currentUrl = providerUrl(
-  redirectUrl.toString(),
-  provider
-);
+    currentUrl = await validatePublicUrl(nextUrl.toString());
   }
 
   throw new Error('Too many provider redirects');
@@ -87,15 +155,19 @@ function errorMessage(error) {
   if (error.response?.status === 403) {
     return 'Provider returned HTTP 403 Forbidden';
   }
+
   if (error.response?.status === 429) {
     return 'Provider rate limit exceeded';
   }
+
   if (error.response?.status) {
     return `Provider returned HTTP ${error.response.status}`;
   }
+
   if (error.code === 'ECONNABORTED') {
     return 'Provider request timed out';
   }
+
   return error.message || 'Provider request failed';
 }
 
@@ -108,7 +180,9 @@ function safeError(error) {
 
 function validateQuery(value) {
   if (typeof value !== 'string') return null;
+
   const query = value.trim();
+
   return query.length >= 1 && query.length <= 100
     ? query
     : null;
@@ -141,10 +215,7 @@ function providerUrl(value, provider) {
 }
 
 async function fetchProviderHtml(url, provider) {
-  const response = await fetchProviderResponse(
-    url,
-    provider
-  );
+  const response = await fetchProviderResponse(url, provider);
 
   if (typeof response.data !== 'string') {
     throw new Error('Unexpected provider response');
@@ -158,6 +229,7 @@ function absoluteUrl(value, base) {
 
   try {
     const url = new URL(value.trim(), base);
+
     return url.protocol === 'https:' || url.protocol === 'http:'
       ? url.toString()
       : '';
@@ -223,6 +295,7 @@ async function searchAnimeSalt(query) {
   const provider = PROVIDERS.AnimeSalt;
   const url = `${provider.base}/?s=${encodeURIComponent(query)}`;
   const $ = await fetchProviderHtml(url, provider);
+
   return extractSearchResults($, 'AnimeSalt');
 }
 
@@ -230,6 +303,7 @@ async function searchToonStream(query) {
   const provider = PROVIDERS.ToonStream;
   const url = `${provider.base}/s?q=${encodeURIComponent(query)}`;
   const $ = await fetchProviderHtml(url, provider);
+
   return extractSearchResults($, 'ToonStream');
 }
 
@@ -369,8 +443,6 @@ function extractAnimeSaltStreams($) {
 
     if (!link) return;
 
-    // Do not decode or resolve embedded player tokens.
-    // Return the provider's original embed URL.
     streams.push({
       server: `Server ${index + 1}`,
       language: 'Default',
@@ -382,6 +454,7 @@ function extractAnimeSaltStreams($) {
   $('#mdl-download .download-links table tbody tr')
     .each((index, element) => {
       const item = $(element);
+
       const link = absoluteUrl(
         item.find('a').first().attr('href'),
         ANIMESALT_BASE
@@ -443,6 +516,7 @@ function extractToonStreamStreams($) {
   $('.cyber-modal .links-list .link-row')
     .each((index, element) => {
       const item = $(element);
+
       const link = absoluteUrl(
         item.find('a.download-btn').attr('href'),
         TOONSTREAM_BASE
@@ -473,9 +547,7 @@ function handleProviderError(res, error, operation) {
   });
 }
 
-// =======================================
-// ROUTES
-// =======================================
+// API ROUTES
 
 app.get('/', (req, res) => {
   res.json({
@@ -494,7 +566,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Combined search
 app.get('/search', async (req, res) => {
   const query = validateQuery(req.query.q);
 
@@ -513,7 +584,6 @@ app.get('/search', async (req, res) => {
   return respondSearch(res, query, result);
 });
 
-// AnimeSalt search
 app.get('/animesalt/search', async (req, res) => {
   const query = validateQuery(req.query.q);
 
@@ -525,10 +595,10 @@ app.get('/animesalt/search', async (req, res) => {
   }
 
   const result = await runSearch(['AnimeSalt'], query);
+
   return respondSearch(res, query, result, 'AnimeSalt');
 });
 
-// ToonStream search
 app.get('/toonstream/search', async (req, res) => {
   const query = validateQuery(req.query.q);
 
@@ -540,10 +610,10 @@ app.get('/toonstream/search', async (req, res) => {
   }
 
   const result = await runSearch(['ToonStream'], query);
+
   return respondSearch(res, query, result, 'ToonStream');
 });
 
-// AnimeSalt episodes
 app.get('/animesalt/episodes', async (req, res) => {
   try {
     const url = providerUrl(
@@ -576,7 +646,6 @@ app.get('/animesalt/episodes', async (req, res) => {
   }
 });
 
-// ToonStream episodes
 app.get('/toonstream/episodes', async (req, res) => {
   try {
     const url = providerUrl(
@@ -609,7 +678,6 @@ app.get('/toonstream/episodes', async (req, res) => {
   }
 });
 
-// AnimeSalt streams
 app.get('/animesalt/streams', async (req, res) => {
   try {
     const url = providerUrl(
@@ -643,7 +711,6 @@ app.get('/animesalt/streams', async (req, res) => {
   }
 });
 
-// ToonStream streams
 app.get('/toonstream/streams', async (req, res) => {
   try {
     const url = providerUrl(
@@ -677,7 +744,6 @@ app.get('/toonstream/streams', async (req, res) => {
   }
 });
 
-// TMDB episode thumbnail
 app.get('/tmdb/episode-thumbnail', async (req, res) => {
   const title = validateQuery(req.query.title);
   const season = Number(req.query.season);
@@ -759,7 +825,6 @@ app.get('/tmdb/episode-thumbnail', async (req, res) => {
   }
 });
 
-// Handle unknown endpoints
 app.use((req, res) => {
   res.status(404).json({
     success: false,
