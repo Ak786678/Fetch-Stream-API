@@ -10,7 +10,7 @@ app.use(express.json({ limit: '32kb' }));
 const PORT = process.env.PORT || 3000;
 
 const ANIMESALT_BASE = 'https://animesalt.cx';
-const TOONSTREAM_BASE = 'https://toonstream.vip';
+const TOONSTREAM_BASE = 'https://toonstream.us';
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
 
 const PROVIDERS = {
