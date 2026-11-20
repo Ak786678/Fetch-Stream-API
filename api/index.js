@@ -32,6 +32,39 @@ const client = axios.create({
   validateStatus: status => status >= 200 && status < 300
 });
 
+async function fetchProviderResponse(url, provider) {
+  let currentUrl = providerUrl(url, provider);
+
+  for (let redirect = 0; redirect <= 5; redirect++) {
+    const response = await client.get(currentUrl, {
+      headers: getHeaders(provider.base),
+      validateStatus: status =>
+        (status >= 200 && status < 300) ||
+        [301, 302, 303, 307, 308].includes(status)
+    });
+
+    if (response.status >= 200 && response.status < 300) {
+      return response;
+    }
+
+    const location = response.headers.location;
+
+    if (!location) {
+      throw new Error('Provider redirect has no destination');
+    }
+
+    // Validate every redirect before making another request.
+    // This prevents the API from following redirects to
+    // arbitrary external hosts.
+    currentUrl = providerUrl(
+      new URL(location, currentUrl).toString(),
+      provider
+    );
+  }
+
+  throw new Error('Too many provider redirects');
+}
+
 function getHeaders(base) {
   return {
     Accept: 'text/html,application/xhtml+xml',
@@ -99,11 +132,10 @@ function providerUrl(value, provider) {
 }
 
 async function fetchProviderHtml(url, provider) {
-  const validated = providerUrl(url, provider);
-
-  const response = await client.get(validated, {
-    headers: getHeaders(provider.base)
-  });
+  const response = await fetchProviderResponse(
+    url,
+    provider
+  );
 
   if (typeof response.data !== 'string') {
     throw new Error('Unexpected provider response');
