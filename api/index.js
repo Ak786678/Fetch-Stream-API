@@ -100,12 +100,17 @@ console.log('PROVIDER DNS CHECK:', {
   }))
 });
   
-  if (
-    addresses.length === 0 ||
-    addresses.some(address => !isPublicAddress(address.address))
-  ) {
-    throw new Error('Redirect destination is not public');
-  }
+  const publicIPv4Addresses = addresses.filter(
+  address =>
+    address.family === 4 &&
+    isPublicAddress(address.address)
+);
+
+if (publicIPv4Addresses.length === 0) {
+  throw new Error(
+    'No public IPv4 address available for redirect'
+  );
+}
 
   return url.toString();
 }
