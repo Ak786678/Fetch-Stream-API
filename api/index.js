@@ -1,541 +1,736 @@
+
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 
 const app = express();
+app.disable('x-powered-by');
+app.use(express.json({ limit: '32kb' }));
+
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+const ANIMESALT_BASE = 'https://animesalt.cx';
+const TOONSTREAM_BASE = 'https://toonstream.vip';
+const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
 
-// Target Domain Configurations
-const ANIMESALT_BASE = "https://animesalt.cx";
-const TOONSTREAM_BASE = "https://toonstream.vip";
-const TMDB_API_KEY = process.env.TMDB_API_KEY || "ed9311c3613b06f414be99abaec5dd86";
+const PROVIDERS = {
+  AnimeSalt: {
+    base: ANIMESALT_BASE,
+    host: new URL(ANIMESALT_BASE).hostname
+  },
+  ToonStream: {
+    base: TOONSTREAM_BASE,
+    host: new URL(TOONSTREAM_BASE).hostname
+  }
+};
 
-// Global Request Headers Generator
-const getHeaders = (refererUrl) => ({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+const client = axios.create({
+  timeout: 12000,
+  maxRedirects: 0,
+  responseType: 'text',
+  maxContentLength: 3 * 1024 * 1024,
+  validateStatus: status => status >= 200 && status < 300
+});
+
+function getHeaders(base) {
+  return {
+    Accept: 'text/html,application/xhtml+xml',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Referer': refererUrl || 'https://google.com'
-});
-
-// Clean URL Sanitizer (Preserves exact URL structure, colons, accents, and ensures trailing slash)
-const fixUrl = (url) => {
-    if (!url) return url;
-    let cleanUrl = url.trim();
-
-    // Ensure trailing slash for page routes if missing
-    if (!cleanUrl.endsWith('/') && !cleanUrl.includes('?')) {
-        cleanUrl += '/';
-    }
-    return cleanUrl;
-};
-
-// Helper function to handle external API / Scraper errors gracefully
-const handleScraperError = (res, err, contextMessage) => {
-    const statusCode = err.response ? err.response.status : 500;
-    let message = contextMessage;
-
-    if (statusCode === 404) {
-        message = "Target resource or page not found";
-    } else if (statusCode === 403) {
-        message = "Access blocked by target server (Cloudflare / WAF)";
-    }
-
-    return res.status(statusCode).json({
-        error: message,
-        upstream_status: statusCode,
-        details: err.message
-    });
-};
-
-// Helper to determine if link is a movie or series
-const detectType = (link, classText) => {
-    if (link && link.includes('/movies/')) return 'movie';
-    if (classText && classText.includes('type-movies')) return 'movie';
-    return 'series';
-};
-
-// ==========================================
-// 1. EXTRACTOR HELPER LOGICS & BYPASSER
-// ==========================================
-
-const searchAnimeSalt = async (query) => {
-    try {
-        const { data } = await axios.get(`${ANIMESALT_BASE}/?s=${encodeURIComponent(query)}`, { 
-            headers: getHeaders(ANIMESALT_BASE),
-            maxRedirects: 5
-        });
-        const $ = cheerio.load(data);
-        const results = [];
-        $('ul.post-lst li').each((index, element) => {
-            const classText = $(element).attr('class') || '';
-            const title = $(element).find('h2.entry-title').text().trim();
-            let link = $(element).find('a.lnk-blk').attr('href');
-            let image = $(element).find('img').attr('data-src') || $(element).find('img').attr('src');
-
-            if (image && image.startsWith('//')) image = 'https:' + image;
-            if (link) {
-                if (!link.startsWith('http')) link = `${ANIMESALT_BASE}${link}`;
-                link = fixUrl(link);
-            }
-
-            const type = detectType(link, classText);
-
-            if (title && link) {
-                results.push({ title, link, image, type, source: 'AnimeSalt' });
-            }
-        });
-        return results;
-   } catch (error) {
-    console.error('AnimeSalt search failed:', {
-        message: error.message,
-        status: error.response?.status,
-        url: error.config?.url
-    });
-    return [];
+    'User-Agent': 'KISSKHTV-FetchStream/2.0',
+    Referer: base + '/'
+  };
 }
-};
 
-const searchToonStream = async (query) => {
-    try {
-        const { data } = await axios.get(`${TOONSTREAM_BASE}/s?q=${encodeURIComponent(query)}`, { 
-            headers: getHeaders(TOONSTREAM_BASE),
-            maxRedirects: 5
-        });
-        const $ = cheerio.load(data);
-        const results = [];
-        $('ul.post-lst li').each((index, element) => {
-            const classText = $(element).attr('class') || '';
-            const title = $(element).find('h2.entry-title').text().trim();
-            let link = $(element).find('a.lnk-blk').attr('href');
-            let image = $(element).find('img').attr('data-src') || $(element).find('img').attr('src');
-
-            if (image && image.startsWith('//')) image = 'https:' + image;
-            if (link) {
-                if (!link.startsWith('http')) {
-                    link = `${TOONSTREAM_BASE}${link.startsWith('/') ? '' : '/'}${link}`;
-                }
-                link = fixUrl(link);
-            }
-
-            const type = detectType(link, classText);
-
-            if (title && link) {
-                results.push({ title, link, image, type, source: 'ToonStream' });
-            }
-        });
-        return results;
-    } catch (error) {
-    console.error('ToonStream search failed:', {
-        message: error.message,
-        status: error.response?.status,
-        url: error.config?.url
-    });
-    return [];
+function errorMessage(error) {
+  if (error.response?.status === 403) {
+    return 'Provider returned HTTP 403 Forbidden';
+  }
+  if (error.response?.status === 429) {
+    return 'Provider rate limit exceeded';
+  }
+  if (error.response?.status) {
+    return `Provider returned HTTP ${error.response.status}`;
+  }
+  if (error.code === 'ECONNABORTED') {
+    return 'Provider request timed out';
+  }
+  return error.message || 'Provider request failed';
 }
-};
 
-// Automatic Resolver for Embed Players
-const resolveEmbedUrl = async (embedUrl) => {
+function safeError(error) {
+  return {
+    message: errorMessage(error),
+    upstream_status: error.response?.status || null
+  };
+}
+
+function validateQuery(value) {
+  if (typeof value !== 'string') return null;
+  const query = value.trim();
+  return query.length >= 1 && query.length <= 100
+    ? query
+    : null;
+}
+
+function providerUrl(value, provider) {
+  if (typeof value !== 'string' || value.length > 2048) {
+    throw new Error('Invalid provider URL');
+  }
+
+  let url;
+
+  try {
+    url = new URL(value, provider.base);
+  } catch (_) {
+    throw new Error('Malformed provider URL');
+  }
+
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname.toLowerCase() !== provider.host ||
+    url.port ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error('URL must belong to the selected provider');
+  }
+
+  return url.toString();
+}
+
+async function fetchProviderHtml(url, provider) {
+  const validated = providerUrl(url, provider);
+
+  const response = await client.get(validated, {
+    headers: getHeaders(provider.base)
+  });
+
+  if (typeof response.data !== 'string') {
+    throw new Error('Unexpected provider response');
+  }
+
+  return cheerio.load(response.data);
+}
+
+function absoluteUrl(value, base) {
+  if (!value || typeof value !== 'string') return '';
+
+  try {
+    const url = new URL(value.trim(), base);
+    return url.protocol === 'https:' || url.protocol === 'http:'
+      ? url.toString()
+      : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function detectType(link, classText = '') {
+  if (link.includes('/movies/')) return 'movie';
+  if (classText.includes('type-movies')) return 'movie';
+  return 'series';
+}
+
+function extractSearchResults($, providerName) {
+  const provider = PROVIDERS[providerName];
+  const results = [];
+  const seen = new Set();
+
+  $('ul.post-lst li').each((index, element) => {
+    const item = $(element);
+    const classText = item.attr('class') || '';
+
+    const title = item.find(
+      'h2.entry-title, h3.entry-title, .entry-title'
+    ).first().text().trim();
+
+    const rawLink = item.find(
+      'a.lnk-blk, a[href]'
+    ).first().attr('href');
+
+    const link = absoluteUrl(rawLink, provider.base);
+
+    const image = absoluteUrl(
+      item.find('img').first().attr('data-src') ||
+      item.find('img').first().attr('src'),
+      provider.base
+    );
+
+    if (!title || !link || seen.has(link)) return;
+
     try {
-        const { data } = await axios.get(embedUrl, { 
-            headers: getHeaders(TOONSTREAM_BASE),
-            timeout: 3000,
-            maxRedirects: 5 
-        });
-        const $ = cheerio.load(data);
-        
-        const nestedIframe = $('iframe').attr('src') || $('iframe').attr('data-src');
-        if (nestedIframe) {
-            return nestedIframe;
-        }
-
-        let directVideoUrl = null;
-        $('script').each((i, el) => {
-            const scriptContent = $(el).html();
-            if (scriptContent) {
-                const m3u8Match = scriptContent.match(/(https?:\/\/[^\s"'`]+\.m3u8[^\s"'`]*)/i);
-                const mp4Match = scriptContent.match(/(https?:\/\/[^\s"'`]+\.mp4[^\s"'`]*)/i);
-                
-                if (m3u8Match) {
-                    directVideoUrl = m3u8Match[1].replace(/\\/g, '');
-                } else if (mp4Match) {
-                    directVideoUrl = mp4Match[1].replace(/\\/g, '');
-                }
-            }
-        });
-
-        return directVideoUrl || embedUrl;
-    } catch (err) {
-        return embedUrl;
+      providerUrl(link, provider);
+    } catch (_) {
+      return;
     }
-};
 
-// ==========================================
-// 2. EXPRESS ROUTES / ENDPOINTS
-// ==========================================
+    seen.add(link);
 
-// HOME STATUS ENDPOINT
+    results.push({
+      title,
+      link,
+      image,
+      type: detectType(link, classText),
+      source: providerName
+    });
+  });
+
+  return results;
+}
+
+async function searchAnimeSalt(query) {
+  const provider = PROVIDERS.AnimeSalt;
+  const url = `${provider.base}/?s=${encodeURIComponent(query)}`;
+  const $ = await fetchProviderHtml(url, provider);
+  return extractSearchResults($, 'AnimeSalt');
+}
+
+async function searchToonStream(query) {
+  const provider = PROVIDERS.ToonStream;
+  const url = `${provider.base}/s?q=${encodeURIComponent(query)}`;
+  const $ = await fetchProviderHtml(url, provider);
+  return extractSearchResults($, 'ToonStream');
+}
+
+async function searchProvider(name, query) {
+  return name === 'AnimeSalt'
+    ? searchAnimeSalt(query)
+    : searchToonStream(query);
+}
+
+async function runSearch(names, query) {
+  const settled = await Promise.allSettled(
+    names.map(name => searchProvider(name, query))
+  );
+
+  const results = [];
+  const providers = {};
+
+  settled.forEach((response, index) => {
+    const name = names[index];
+
+    if (response.status === 'fulfilled') {
+      results.push(...response.value);
+
+      providers[name] = {
+        success: true,
+        count: response.value.length
+      };
+    } else {
+      console.error(`${name} search failed`, {
+        message: errorMessage(response.reason),
+        status: response.reason.response?.status || null
+      });
+
+      providers[name] = {
+        success: false,
+        ...safeError(response.reason)
+      };
+    }
+  });
+
+  return {
+    success: settled.some(item => item.status === 'fulfilled'),
+    results,
+    providers
+  };
+}
+
+function respondSearch(res, query, result, source = null) {
+  const allFailed = !result.success;
+
+  return res.status(allFailed ? 502 : 200).json({
+    success: !allFailed,
+    ...(source ? { source } : { query }),
+    total: result.results.length,
+    results: result.results,
+    providers: result.providers
+  });
+}
+
+function extractEpisodes($, providerName) {
+  const provider = PROVIDERS[providerName];
+  const episodes = [];
+  const seasons = [];
+
+  $('.season-btn').each((index, element) => {
+    const button = $(element);
+    const seasonNum = button.attr('data-season');
+
+    if (!seasonNum) return;
+
+    seasons.push({
+      name: button.text().trim(),
+      seasonNum,
+      ...(providerName === 'AnimeSalt'
+        ? { postId: button.attr('data-post') || '' }
+        : { ajaxUrl: button.attr('data-url') || '' })
+    });
+  });
+
+  $('#episode_by_temp li').each((index, element) => {
+    const item = $(element);
+
+    const rawLink = item.find('a.lnk-blk').attr('href');
+    const link = absoluteUrl(rawLink, provider.base);
+
+    if (!link) return;
+
+    try {
+      providerUrl(link, provider);
+    } catch (_) {
+      return;
+    }
+
+    episodes.push({
+      epNum: item.find('.num-epi').text().trim() ||
+        String(index + 1),
+      title: item.find(
+        'h2.entry-title, h5.entry-title1, .entry-title'
+      ).first().text().trim(),
+      link,
+      image: absoluteUrl(
+        item.find('img').first().attr('data-src') ||
+        item.find('img').first().attr('src'),
+        provider.base
+      ) || null
+    });
+  });
+
+  return { seasons, episodes };
+}
+
+function extractMetadata($, base) {
+  return {
+    title: $('h1.entry-title, h1').first().text().trim() || null,
+    poster_image: absoluteUrl(
+      $('.post-thumbnail img').first().attr('data-src') ||
+      $('.post-thumbnail img').first().attr('src'),
+      base
+    ) || null,
+    thumbnail_image: absoluteUrl(
+      $('.bghd img').first().attr('data-src') ||
+      $('.bghd img').first().attr('src'),
+      base
+    ) || null
+  };
+}
+
+function extractAnimeSaltStreams($) {
+  const streams = [];
+  const downloads = [];
+
+  $('#aa-options iframe').each((index, element) => {
+    const raw = $(element).attr('src') ||
+      $(element).attr('data-src');
+
+    const link = absoluteUrl(raw, ANIMESALT_BASE);
+
+    if (!link) return;
+
+    // Do not decode or resolve embedded player tokens.
+    // Return the provider's original embed URL.
+    streams.push({
+      server: `Server ${index + 1}`,
+      language: 'Default',
+      link,
+      type: 'embed'
+    });
+  });
+
+  $('#mdl-download .download-links table tbody tr')
+    .each((index, element) => {
+      const item = $(element);
+      const link = absoluteUrl(
+        item.find('a').first().attr('href'),
+        ANIMESALT_BASE
+      );
+
+      if (!link) return;
+
+      downloads.push({
+        server: item.find('td').first().text().trim() ||
+          'Download',
+        language: item.find('td:nth-child(2)').text().trim() ||
+          'Default',
+        quality: item.find('td:nth-child(3)').text().trim() ||
+          'Unknown',
+        link
+      });
+    });
+
+  return { streams, downloads };
+}
+
+function extractToonStreamStreams($) {
+  const streams = [];
+  const downloads = [];
+  const serverMap = {};
+
+  $('.video-options .aa-tbs-video li')
+    .each((index, element) => {
+      const item = $(element);
+      const option = item.find('a.btn').attr('href');
+
+      if (option && option.startsWith('#')) {
+        serverMap[option.slice(1)] =
+          item.find('.server').text().trim() ||
+          `Server ${index + 1}`;
+      }
+    });
+
+  $('.video-player .video').each((index, element) => {
+    const item = $(element);
+    const id = item.attr('id');
+
+    const link = absoluteUrl(
+      item.find('iframe').first().attr('src') ||
+      item.find('iframe').first().attr('data-src'),
+      TOONSTREAM_BASE
+    );
+
+    if (!link) return;
+
+    streams.push({
+      server: serverMap[id] || `Server ${index + 1}`,
+      link,
+      type: 'embed',
+      is_bypassed: false
+    });
+  });
+
+  $('.cyber-modal .links-list .link-row')
+    .each((index, element) => {
+      const item = $(element);
+      const link = absoluteUrl(
+        item.find('a.download-btn').attr('href'),
+        TOONSTREAM_BASE
+      );
+
+      if (!link) return;
+
+      downloads.push({
+        server: item.find('.server-name').text().trim() ||
+          `Mirror ${index + 1}`,
+        link
+      });
+    });
+
+  return { streams, downloads };
+}
+
+function handleProviderError(res, error, operation) {
+  console.error(`${operation} failed`, {
+    message: errorMessage(error),
+    upstream_status: error.response?.status || null
+  });
+
+  return res.status(502).json({
+    success: false,
+    error: `${operation} failed`,
+    ...safeError(error)
+  });
+}
+
+// =======================================
+// ROUTES
+// =======================================
+
 app.get('/', (req, res) => {
-    res.json({
-        status: "Active",
-        message: "FetchStream Scraper API is running.",
-        sources: [ "AnimeSalt", "ToonStream" ]
-    });
+  res.json({
+    status: 'Active',
+    message: 'FetchStream API is running.',
+    version: '2.0.0',
+    sources: ['AnimeSalt', 'ToonStream']
+  });
 });
 
-// A. COMBINED SEARCH (Queries both platforms parallelly with type detection)
+app.get('/health', (req, res) => {
+  res.json({
+    success: true,
+    status: 'online',
+    version: '2.0.0'
+  });
+});
+
+// Combined search
 app.get('/search', async (req, res) => {
-    const query = req.query.q;
-    if (!query) return res.status(400).json({ error: "Query parameter 'q' is required" });
+  const query = validateQuery(req.query.q);
 
-    const [saltResults, toonResults] = await Promise.all([
-        searchAnimeSalt(query),
-        searchToonStream(query)
-    ]);
-
-    res.json({
-        query,
-        total: saltResults.length + toonResults.length,
-        results: [...saltResults, ...toonResults]
+  if (!query) {
+    return res.status(400).json({
+      success: false,
+      error: 'Valid q parameter is required (1-100 characters)'
     });
+  }
+
+  const result = await runSearch(
+    ['AnimeSalt', 'ToonStream'],
+    query
+  );
+
+  return respondSearch(res, query, result);
 });
 
-// B. DEDICATED ANIME SALT ENDPOINTS
+// AnimeSalt search
 app.get('/animesalt/search', async (req, res) => {
-    const query = req.query.q;
-    if (!query) return res.status(400).json({ error: "Query 'q' is required" });
-    const results = await searchAnimeSalt(query);
-    res.json({ source: "AnimeSalt", results });
+  const query = validateQuery(req.query.q);
+
+  if (!query) {
+    return res.status(400).json({
+      success: false,
+      error: 'Valid q parameter is required'
+    });
+  }
+
+  const result = await runSearch(['AnimeSalt'], query);
+  return respondSearch(res, query, result, 'AnimeSalt');
 });
 
-app.get('/animesalt/episodes', async (req, res) => {
-    const rawUrl = req.query.url;
-    if (!rawUrl) return res.status(400).json({ error: "URL is required" });
-
-    const pageUrl = fixUrl(rawUrl);
-
-    try {
-        const { data } = await axios.get(pageUrl, { 
-            headers: getHeaders(ANIMESALT_BASE),
-            maxRedirects: 5 
-        });
-        const $ = cheerio.load(data);
-        const episodes = [];
-        const seasons = [];
-
-        $('.season-btn').each((i, el) => {
-            const name = $(el).text().trim();
-            const seasonNum = $(el).attr('data-season');
-            const postId = $(el).attr('data-post');
-            if (seasonNum && postId) seasons.push({ name, seasonNum, postId });
-        });
-
-        $('#episode_by_temp li').each((i, element) => {
-            const epNum = $(element).find('.num-epi').text().trim();
-            const title = $(element).find('h2.entry-title').text().trim();
-            let link = $(element).find('a.lnk-blk').attr('href');
-            
-            if (link) {
-                if (!link.startsWith('http')) link = `${ANIMESALT_BASE}${link}`;
-                link = fixUrl(link);
-            }
-
-            let image = $(element).find('img').attr('data-src') || $(element).find('img').attr('src');
-            if (image && image.startsWith('//')) image = 'https:' + image;
-
-            if (link) episodes.push({ 
-                epNum: epNum || (i + 1).toString(), 
-                title, 
-                link,
-                image: image || null
-            });
-        });
-
-        res.json({ seasons, episodes });
-    } catch (err) {
-        handleScraperError(res, err, "Failed to load episodes from AnimeSalt");
-    }
-});
-
-app.get('/animesalt/streams', async (req, res) => {
-    const rawUrl = req.query.url;
-    if (!rawUrl) return res.status(400).json({ error: "URL is required" });
-
-    const epUrl = fixUrl(rawUrl);
-
-    try {
-        const { data } = await axios.get(epUrl, { 
-            headers: getHeaders(ANIMESALT_BASE),
-            maxRedirects: 5 
-        });
-        const $ = cheerio.load(data);
-        const streamSources = [];
-        const downloadSources = [];
-
-        // 1. Scrape metadata & Poster/Backdrop
-        const title = $('h1').text().trim();
-        let poster = $('.post-thumbnail img').attr('src') || $('.post-thumbnail img').attr('data-src') || $('.bd img[src*="tmdb.org"]').attr('src') || $('.bd img').first().attr('src');
-        let backdrop = $('.bghd img.TPostBg').attr('src') || $('.bghd img').attr('src') || $('.bghd img').attr('data-src');
-
-        if (poster && poster.startsWith('//')) poster = `https:${poster}`;
-        if (backdrop && backdrop.startsWith('//')) backdrop = `https:${backdrop}`;
-
-        // 2. Scrape Streaming Players
-        $('#aa-options iframe').each((index, element) => {
-            const src = $(element).attr('src') || $(element).attr('data-src');
-            if (!src) return;
-
-            if (src.includes('?data=')) {
-                try {
-                    const urlObj = new URL(src);
-                    const base64Data = urlObj.searchParams.get('data');
-                    if (base64Data) {
-                        const decodedJson = Buffer.from(base64Data, 'base64').toString('utf-8');
-                        const parsedStreams = JSON.parse(decodedJson);
-                        parsedStreams.forEach(stream => {
-                            streamSources.push({ server: 'Abyss (Multi-Lang)', language: stream.language, link: stream.link });
-                        });
-                    }
-                } catch {}
-            } else {
-                let serverName = 'Server';
-                if (src.includes('as-cdn')) serverName = 'playX';
-                streamSources.push({ server: serverName, language: 'Default', link: src });
-            }
-        });
-
-        // 3. Scrape Download Table
-        $('#mdl-download .download-links table tbody tr').each((i, el) => {
-            const server = $(el).find('td').first().text().replace(/#\d+\s*/g, '').trim(); 
-            const lang = $(el).find('td:nth-child(2)').text().trim(); 
-            const quality = $(el).find('td:nth-child(3)').text().trim(); 
-            let link = $(el).find('a').attr('href');
-
-            if (link) {
-                if (link.startsWith('/')) link = `${ANIMESALT_BASE}${link}`;
-                downloadSources.push({
-                    server: server || 'Download',
-                    language: lang || 'Default',
-                    quality: quality || 'HD',
-                    link: fixUrl(link)
-                });
-            }
-        });
-
-        res.json({ 
-            title: title || null,
-            poster_image: poster || null,
-            thumbnail_image: backdrop || null,
-            streams: streamSources,
-            downloads: downloadSources
-        });
-    } catch (err) {
-        handleScraperError(res, err, "Failed to load streams from AnimeSalt");
-    }
-});
-
-// C. DEDICATED TOON STREAM ENDPOINTS
+// ToonStream search
 app.get('/toonstream/search', async (req, res) => {
-    const query = req.query.q;
-    if (!query) return res.status(400).json({ error: "Query 'q' is required" });
-    const results = await searchToonStream(query);
-    res.json({ source: "ToonStream", results });
+  const query = validateQuery(req.query.q);
+
+  if (!query) {
+    return res.status(400).json({
+      success: false,
+      error: 'Valid q parameter is required'
+    });
+  }
+
+  const result = await runSearch(['ToonStream'], query);
+  return respondSearch(res, query, result, 'ToonStream');
 });
 
+// AnimeSalt episodes
+app.get('/animesalt/episodes', async (req, res) => {
+  try {
+    const url = providerUrl(
+      req.query.url,
+      PROVIDERS.AnimeSalt
+    );
+
+    const $ = await fetchProviderHtml(
+      url,
+      PROVIDERS.AnimeSalt
+    );
+
+    return res.json({
+      success: true,
+      ...extractEpisodes($, 'AnimeSalt')
+    });
+  } catch (error) {
+    if (error.message?.includes('URL')) {
+      return res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+
+    return handleProviderError(
+      res,
+      error,
+      'AnimeSalt episodes'
+    );
+  }
+});
+
+// ToonStream episodes
 app.get('/toonstream/episodes', async (req, res) => {
-    const rawUrl = req.query.url;
-    if (!rawUrl) return res.status(400).json({ error: "URL is required" });
+  try {
+    const url = providerUrl(
+      req.query.url,
+      PROVIDERS.ToonStream
+    );
 
-    const pageUrl = fixUrl(rawUrl);
+    const $ = await fetchProviderHtml(
+      url,
+      PROVIDERS.ToonStream
+    );
 
-    try {
-        const { data } = await axios.get(pageUrl, { 
-            headers: getHeaders(TOONSTREAM_BASE),
-            maxRedirects: 5 
-        });
-        const $ = cheerio.load(data);
-        const episodes = [];
-        const seasons = [];
-
-        $('.season-btn').each((i, el) => {
-            const name = $(el).text().trim();
-            const seasonNum = $(el).attr('data-season');
-            const url = $(el).attr('data-url');
-            if (seasonNum) seasons.push({ name, seasonNum, ajaxUrl: url });
-        });
-
-        $('#episode_by_temp li').each((i, element) => {
-            const epNum = $(element).find('.num-epi').text().trim();
-            const title = $(element).find('h5.entry-title1').text().trim();
-            let link = $(element).find('a.lnk-blk').attr('href');
-            
-            if (link) {
-                if (!link.startsWith('http')) {
-                    link = `${TOONSTREAM_BASE}${link.startsWith('/') ? '' : '/'}${link}`;
-                }
-                link = fixUrl(link);
-            }
-
-            let image = $(element).find('img').attr('data-src') || $(element).find('img').attr('src');
-            if (image && image.startsWith('//')) image = 'https:' + image;
-
-            if (link) episodes.push({ 
-                epNum: epNum || (i + 1).toString(), 
-                title, 
-                link,
-                image: image || null
-            });
-        });
-
-        res.json({ seasons, episodes });
-    } catch (err) {
-        handleScraperError(res, err, "Failed to load episodes from ToonStream");
+    return res.json({
+      success: true,
+      ...extractEpisodes($, 'ToonStream')
+    });
+  } catch (error) {
+    if (error.message?.includes('URL')) {
+      return res.status(400).json({
+        success: false,
+        error: error.message
+      });
     }
+
+    return handleProviderError(
+      res,
+      error,
+      'ToonStream episodes'
+    );
+  }
 });
 
+// AnimeSalt streams
+app.get('/animesalt/streams', async (req, res) => {
+  try {
+    const url = providerUrl(
+      req.query.url,
+      PROVIDERS.AnimeSalt
+    );
+
+    const $ = await fetchProviderHtml(
+      url,
+      PROVIDERS.AnimeSalt
+    );
+
+    return res.json({
+      success: true,
+      ...extractMetadata($, ANIMESALT_BASE),
+      ...extractAnimeSaltStreams($)
+    });
+  } catch (error) {
+    if (error.message?.includes('URL')) {
+      return res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+
+    return handleProviderError(
+      res,
+      error,
+      'AnimeSalt streams'
+    );
+  }
+});
+
+// ToonStream streams
 app.get('/toonstream/streams', async (req, res) => {
-    const rawUrl = req.query.url;
-    if (!rawUrl) return res.status(400).json({ error: "URL is required" });
+  try {
+    const url = providerUrl(
+      req.query.url,
+      PROVIDERS.ToonStream
+    );
 
-    const epUrl = fixUrl(rawUrl);
+    const $ = await fetchProviderHtml(
+      url,
+      PROVIDERS.ToonStream
+    );
 
-    try {
-        const { data } = await axios.get(epUrl, { 
-            headers: getHeaders(TOONSTREAM_BASE),
-            maxRedirects: 5 
-        });
-        const $ = cheerio.load(data);
-        const rawStreams = [];
-        const downloadSources = [];
-
-        // 1. Metadata Extraction
-        const title = $('h1.entry-title').text().trim();
-        let poster = $('.post-thumbnail img').attr('src') || $('.post-thumbnail img').attr('data-src');
-        let backdrop = $('.bghd img.TPostBg').attr('src') || $('.bghd img').attr('src') || $('.bghd img').attr('data-src');
-
-        if (poster && poster.startsWith('/')) poster = `${TOONSTREAM_BASE}${poster}`;
-        if (backdrop && backdrop.startsWith('/')) backdrop = `${TOONSTREAM_BASE}${backdrop}`;
-        if (backdrop && backdrop.startsWith('//')) backdrop = `https:${backdrop}`;
-        if (poster && poster.startsWith('//')) poster = `https:${poster}`;
-
-        // 2. Map server buttons to options
-        const serverMap = {};
-        $('.video-options .aa-tbs-video li').each((i, el) => {
-            const optionId = $(el).find('a.btn').attr('href');
-            const serverName = $(el).find('.server').text().trim() || `Server ${i + 1}`;
-            if (optionId) {
-                serverMap[optionId.replace('#', '')] = serverName;
-            }
-        });
-
-        // 3. Parse Raw Embed links
-        $('.video-player .video').each((i, el) => {
-            const id = $(el).attr('id');
-            let src = $(el).find('iframe').attr('src') || $(el).find('iframe').attr('data-src');
-            if (!src || src === 'about:blank') return;
-
-            if (src && src.startsWith('/')) {
-                src = `${TOONSTREAM_BASE}${src}`;
-            }
-
-            const serverName = serverMap[id] || `Server ${i + 1}`;
-            rawStreams.push({ serverName, link: src });
-        });
-
-        // 4. Resolve embeds
-        const resolvedStreams = await Promise.all(
-            rawStreams.map(async (stream) => {
-                if (stream.link.includes('/embed/')) {
-                    const bypassedLink = await resolveEmbedUrl(stream.link);
-                    return {
-                        server: stream.serverName,
-                        link: bypassedLink,
-                        is_bypassed: bypassedLink !== stream.link
-                    };
-                }
-                return {
-                    server: stream.serverName,
-                    link: stream.link,
-                    is_bypassed: false
-                };
-            })
-        );
-
-        // 5. Parse Downloads
-        $('.cyber-modal .links-list .link-row').each((i, el) => {
-            const serverName = $(el).find('.server-name').text().trim();
-            const downloadLink = $(el).find('a.download-btn').attr('href');
-            if (downloadLink) {
-                downloadSources.push({
-                    server: serverName || `Mirror ${i + 1}`,
-                    link: downloadLink
-                });
-            }
-        });
-
-        res.json({
-            title: title || null,
-            poster_image: poster || null,
-            thumbnail_image: backdrop || null,
-            streams: resolvedStreams,
-            downloads: downloadSources
-        });
-    } catch (err) {
-        handleScraperError(res, err, "Failed to load streams from ToonStream");
+    return res.json({
+      success: true,
+      ...extractMetadata($, TOONSTREAM_BASE),
+      ...extractToonStreamStreams($)
+    });
+  } catch (error) {
+    if (error.message?.includes('URL')) {
+      return res.status(400).json({
+        success: false,
+        error: error.message
+      });
     }
+
+    return handleProviderError(
+      res,
+      error,
+      'ToonStream streams'
+    );
+  }
 });
 
-// D. TMDb OFFICIAL METADATA & EPISODE THUMBNAIL SERVICE
+// TMDB episode thumbnail
 app.get('/tmdb/episode-thumbnail', async (req, res) => {
-    const { title, season, episode } = req.query;
-    if (!title || !season || !episode) {
-        return res.status(400).json({ error: "Query parameters 'title', 'season', and 'episode' are required." });
+  const title = validateQuery(req.query.title);
+  const season = Number(req.query.season);
+  const episode = Number(req.query.episode);
+
+  if (
+    !title ||
+    !Number.isInteger(season) ||
+    !Number.isInteger(episode) ||
+    season < 0 ||
+    episode < 1
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: 'Valid title, season and episode are required'
+    });
+  }
+
+  if (!TMDB_API_KEY) {
+    return res.status(503).json({
+      success: false,
+      error: 'TMDB_API_KEY environment variable is not configured'
+    });
+  }
+
+  try {
+    const search = await axios.get(
+      'https://api.themoviedb.org/3/search/tv',
+      {
+        params: {
+          api_key: TMDB_API_KEY,
+          query: title
+        },
+        timeout: 12000
+      }
+    );
+
+    const show = search.data?.results?.[0];
+
+    if (!show) {
+      return res.status(404).json({
+        success: false,
+        error: 'TV show not found'
+      });
     }
 
-    try {
-        const searchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(title)}`;
-        const searchRes = await axios.get(searchUrl);
-        const tvShow = searchRes.data.results[0];
+    const response = await axios.get(
+      `https://api.themoviedb.org/3/tv/${show.id}/season/${season}/episode/${episode}`,
+      {
+        params: { api_key: TMDB_API_KEY },
+        timeout: 12000
+      }
+    );
 
-        if (!tvShow) {
-            return res.status(404).json({ error: `No show found on TMDB matching '${title}'` });
-        }
+    const data = response.data;
 
-        const tvId = tvShow.id;
-
-        const epUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${season}/episode/${episode}?api_key=${TMDB_API_KEY}`;
-        const epRes = await axios.get(epUrl);
-        const epData = epRes.data;
-
-        if (epData && epData.still_path) {
-            res.json({
-                found: true,
-                tv_id: tvId,
-                show_title: tvShow.name,
-                episode_name: epData.name || `Episode ${episode}`,
-                overview: epData.overview || "",
-                air_date: epData.air_date || null,
-                thumbnails: {
-                    w500: `https://image.tmdb.org/t/p/w500${epData.still_path}`,
-                    w780: `https://image.tmdb.org/t/p/w780${epData.still_path}`,
-                    original: `https://image.tmdb.org/t/p/original${epData.still_path}`
-                }
-            });
-        } else {
-            res.status(404).json({ error: "Episode found on TMDB, but no screenshot (still_path) exists for it." });
-        }
-
-    } catch (err) {
-        handleScraperError(res, err, "Failed to query TMDB API");
+    if (!data?.still_path) {
+      return res.status(404).json({
+        success: false,
+        error: 'Episode thumbnail not available'
+      });
     }
+
+    return res.json({
+      found: true,
+      tv_id: show.id,
+      show_title: show.name,
+      episode_name: data.name || `Episode ${episode}`,
+      overview: data.overview || '',
+      air_date: data.air_date || null,
+      thumbnails: {
+        w500: `https://image.tmdb.org/t/p/w500${data.still_path}`,
+        w780: `https://image.tmdb.org/t/p/w780${data.still_path}`,
+        original: `https://image.tmdb.org/t/p/original${data.still_path}`
+      }
+    });
+  } catch (error) {
+    return handleProviderError(res, error, 'TMDB lookup');
+  }
 });
 
-// Listen Port
+// Handle unknown endpoints
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found'
+  });
+});
+
+// Start locally; Vercel uses exported app.
 if (process.env.NODE_ENV !== 'production') {
-    app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`FetchStream API listening on port ${PORT}`);
+  });
 }
 
 module.exports = app;
