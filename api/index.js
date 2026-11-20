@@ -56,10 +56,19 @@ async function fetchProviderResponse(url, provider) {
     // Validate every redirect before making another request.
     // This prevents the API from following redirects to
     // arbitrary external hosts.
-    currentUrl = providerUrl(
-      new URL(location, currentUrl).toString(),
-      provider
-    );
+    const redirectUrl = new URL(location, currentUrl);
+
+console.log('PROVIDER REDIRECT:', {
+  from: new URL(currentUrl).hostname,
+  to: redirectUrl.hostname,
+  path: redirectUrl.pathname,
+  status: response.status
+});
+
+currentUrl = providerUrl(
+  redirectUrl.toString(),
+  provider
+);
   }
 
   throw new Error('Too many provider redirects');
